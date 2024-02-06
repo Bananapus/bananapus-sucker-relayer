@@ -3,14 +3,31 @@ Tool that automatically performs the proving and finalization for L2 -> L1 trans
 
 **Unstable and not ready for production**
 
-To install dependencies:
+## Run with docker
 
+Create the `.env` file.
+
+Build the container:
+```bash
+docker build -t bananapus-sucker-relayer .
+```
+
+Start the container:
+
+```bash
+docker run  bananapus-sucker-relayer
+```
+
+## Run on local machine (or for development)
+
+Create the `.env` file.
+
+Install the dependencies:
 ```bash
 bun install
 ```
 
-To run:
-
+Run the relayer:
 ```bash
 bun run index.ts
 ```
