@@ -1,6 +1,8 @@
 import * as dotenv from 'dotenv'
-import { CrossChainMessenger, MessageStatus, type CrossChainMessage, type ProviderLike } from '@eth-optimism/sdk';
+import { CrossChainMessenger, MessageStatus, type CrossChainMessage} from '@eth-optimism/sdk';
 import { ethers } from 'ethers';
+import { Defender } from '@openzeppelin/defender-sdk';
+import type { RelayerTransaction } from '@openzeppelin/defender-sdk-relay-signer-client';
 
 // Load the env file.
 dotenv.config()
@@ -44,9 +46,7 @@ function getMessageType(message: CrossChainMessage, l1suckerAddr: string, l2suck
 }
 
 
-async function handleMessages(xMessenger: CrossChainMessenger, messages: CrossChainMessage[]) {
-    console.log(`found ${messages.length} messages`);
-
+async function handleMessages(defender: Defender, xMessenger: CrossChainMessenger, messages: CrossChainMessage[]) {
     // For loop over messages
     for (let index = 0; index < messages.length; index++) {
         try {
@@ -62,49 +62,76 @@ async function handleMessages(xMessenger: CrossChainMessenger, messages: CrossCh
         
             // Ensure transactions have to do with the project.
             if(priority == MessageType.DO_NOT_EXECUTE) continue;
-
             let type = priority == MessageType.VALUE ? "value-message" : "root-message";
         
-            // TODO: Add check to see if we need to execute this message. Ex if we already have a newer nonce.
-        
+            // TODO: Add check to see if we need to execute this message. Ex if we already have a newer (smt) nonce.
+
             // Perform the action required.
-            let tx: ethers.providers.TransactionResponse;
+            let tx: ethers.providers.TransactionRequest;
+            let state;
             if(status == MessageStatus.READY_TO_PROVE) {
-                console.log(`Proving ${type} from ${message.blockNumber}`);
-                tx = await xMessenger.proveMessage(message, undefined, index);
+                state = "Proving"
+                tx = await xMessenger.populateTransaction.proveMessage(message, undefined, index);
             }else if(status == MessageStatus.READY_FOR_RELAY) {
-                console.log(`Finalizing ${type} from ${message.blockNumber}`);
-                tx = await xMessenger.finalizeMessage(message, undefined, index);
+                state = "Finalization"
+                tx =  await xMessenger.populateTransaction.finalizeMessage(message, undefined, index);
             } else {
                 continue;
             }
+
+            // Get the pending transactions.
+            // We fetch it each time because we want it to be up to date.
+            let pendingTxs = await defender.relaySigner.listTransactions({
+                status: 'pending',
+                usePagination: false
+            }) as RelayerTransaction[];
+
+            // Check if the current tx is already pending on the relayer.
+            let txAlreadyPending = false;
+            for (const index in pendingTxs) {
+                const pendingTx: RelayerTransaction = pendingTxs[index];
+                
+                if(
+                    tx.to == pendingTx.to &&
+                    tx.data == pendingTx.data
+                ){
+                    txAlreadyPending = true;
+                    break;
+                }
+            }
+
+            // If it was pending we log and do nothing, 
+            // in the future we could want to replace the transaction with one with a higher gas limit.
+            if(txAlreadyPending) {
+                console.log(`[${new Date().toISOString()}] ${state} of ${type} transaction from block ${message.blockNumber} found in relayer pending queue.`);
+                break;
+            }
             
-            console.log("Waiting for 3 blocks of confirmation...");
-            let receipt = await tx.wait(3);
-            console.log("Confirmations done!");
+            // Send the tx to the relayer.
+            await xMessenger.l1Signer.sendTransaction(tx);
+            console.log(`[${new Date().toISOString()}] ${state} of ${type} transaction from block ${message.blockNumber} send to relayer 🛫`);
 
         } catch (error) {
+            console.log(`[${new Date().toISOString()}] ❌ Fatal error occured for ${messages[index].transactionHash}`);
             console.error(error);
-            console.log("Skipping this transaction because of an error..");
         }
     }
 }
 
 
 async function checkAllRecentSucks(
+    defender: Defender,
     l2Provider: ethers.providers.Provider,
     xMessenger: CrossChainMessenger
 ) {
 
     let upToBlock = await l2Provider.getBlockNumber();
     // latestBlock minus a week in seconds divided by 2 second blocks.
-    // const oldestBlock = upToBlock - (60 * 60 * 24 * 7 / 2); 
-    const oldestBlock = upToBlock - 10_000;
-    const paginateSize = 100;
+    const oldestBlock = upToBlock - (60 * 60 * 24 * 7 / 2); 
+    const paginateSize = 500; // 3000;
 
     let lastLogTxHash;
     while (upToBlock >= oldestBlock) {
-        console.log(`looking in blocks ${upToBlock - paginateSize} - ${upToBlock}`);
         const filter = {
             address: process.env.L2_SUCKER_ADDRESS!,
             topics: [
@@ -132,21 +159,55 @@ async function checkAllRecentSucks(
             );
 
             // Check if the messages require work to be done and perform work if needed.
-            await handleMessages(xMessenger, messages);
+            await handleMessages(defender, xMessenger, messages);
         }
     }
 }
 
-const L1Provider = new ethers.providers.JsonRpcProvider(process.env.L1_RPC_URL!);
+
+const client = new Defender({
+    relayerApiKey: process.env.OZ_DEFENDER_RELAY_API_KEY!,
+    relayerApiSecret: process.env.OZ_DEFENDER_RELAY_API_SECRET!,
+});
+
 const L2Provider = new ethers.providers.JsonRpcProvider(process.env.L2_RPC_URL!);
-const l1Signer = new ethers.Wallet(process.env.EOA_PRIVATE_KEY!, L1Provider);
+
+// Check if the relayer has been paused.
+let status = await client.relaySigner.getRelayerStatus();
+if(status.paused) {
+    console.error("The OZ Defender relayer has been paused.");
+    process.exit(1);
+}
+
+const signer = client.relaySigner.getSigner(
+    // If there is no custom RPC set we use the one that OZ provides us.
+    process.env.L1_RPC_URL ?
+        new ethers.providers.JsonRpcProvider(process.env.L1_RPC_URL!):
+        client.relaySigner.getProvider(),
+    { speed: 'safeLow' }
+);
 
 const xMessenger = new CrossChainMessenger({
-    l1SignerOrProvider: l1Signer,
+    l1SignerOrProvider: signer,
     l2SignerOrProvider: L2Provider,
     l1ChainId: parseInt(process.env.L1_CHAIN_ID!),
     l2ChainId: parseInt(process.env.L2_CHAIN_ID!),
     bedrock: true,
 });
 
-await checkAllRecentSucks(L2Provider, xMessenger);
+// 5 minutes between runs.
+const timeBetweenRuns = 5 * 60 * 1000;
+while(true) {
+    console.log(`[${new Date().toISOString()}] Starting a new run 👀`);
+
+    try {
+        await checkAllRecentSucks(client, L2Provider, xMessenger);
+        console.log(`[${new Date().toISOString()}] Run finished`);
+    } catch (error) {
+        console.log(`[${new Date().toISOString()}] ❌ Run failed with the following error:`);
+        console.error(error);
+    }
+    
+    console.log(`[${new Date().toISOString()}] Waiting ${timeBetweenRuns / 1000 / 60} minutes for the next run...`);
+    await Bun.sleep(timeBetweenRuns);
+}
