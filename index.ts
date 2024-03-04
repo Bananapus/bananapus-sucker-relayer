@@ -135,8 +135,7 @@ async function checkAllRecentSucks(
         const filter = {
             address: process.env.L2_SUCKER_ADDRESS!,
             topics: [
-                // the name of the event, parnetheses containing the data type of each event, no spaces
-                ethers.utils.id("SuckingToRemote(address,uint64)")
+                ethers.utils.id("RootToRemote(bytes32,address,uint256,uint64)")
             ],
             fromBlock: upToBlock - paginateSize,
             toBlock: upToBlock
